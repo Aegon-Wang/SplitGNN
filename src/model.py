@@ -34,6 +34,7 @@ Technical Implementation:
 - For homogeneous graphs: Uses DGL's update_all with user-defined functions
 - For heterogeneous graphs: Uses manual edge-wise computation to avoid DGL limitations
 - Handles multi-edge types and ensures robust error handling
+- Compatible across DGL versions (handles missing is_heterogeneous attribute)
 
 Usage:
 - Set 'use_cooperative_attention: True' in config files to enable
@@ -239,6 +240,30 @@ class CooperativeAttention(nn.Module):
                       self.cooperative_gate, self.output_proj]:
             nn.init.xavier_uniform_(module.weight)
 
+    def _is_heterogeneous(self, graph):
+        """Check if graph is heterogeneous - compatible across DGL versions"""
+        # Method 1: Check if is_heterogeneous attribute exists (newer DGL)
+        if hasattr(graph, 'is_heterogeneous'):
+            return graph.is_heterogeneous
+        
+        # Method 2: Check number of edge types (older DGL)
+        if hasattr(graph, 'etypes'):
+            return len(graph.etypes) > 1
+        
+        # Method 3: Check if canonical_etypes exists and has multiple types
+        if hasattr(graph, 'canonical_etypes'):
+            return len(graph.canonical_etypes) > 1
+        
+        # Method 4: Try to access etypes and catch exception
+        try:
+            etypes = graph.etypes
+            return len(etypes) > 1
+        except:
+            pass
+        
+        # Default: assume homogeneous
+        return False
+
     def structural_attention(self, graph, feat):
         """Compute structural attention based on graph topology"""
         with graph.local_scope():
@@ -252,14 +277,15 @@ class CooperativeAttention(nn.Module):
             graph.ndata['value'] = value
             
             # Handle heterogeneous graphs
-            if graph.is_heterogeneous:
+            if self._is_heterogeneous(graph):
                 # Use built-in functions for heterogeneous graphs
                 # Initialize attention output
                 num_nodes = feat.shape[0]
                 struct_attention = torch.zeros(num_nodes, self.hidden_dim, device=feat.device)
                 
                 # Process each edge type separately
-                for etype in graph.etypes:
+                etypes = getattr(graph, 'etypes', [])
+                for etype in etypes:
                     try:
                         edges = graph.edges(etype=etype)
                         if len(edges[0]) > 0:  # Check if edges exist
@@ -318,14 +344,15 @@ class CooperativeAttention(nn.Module):
             graph.ndata['value'] = value
             
             # Handle heterogeneous graphs
-            if graph.is_heterogeneous:
+            if self._is_heterogeneous(graph):
                 # Use built-in functions for heterogeneous graphs
                 # Initialize attention output
                 num_nodes = feat.shape[0]
                 feat_attention = torch.zeros(num_nodes, self.hidden_dim, device=feat.device)
                 
                 # Process each edge type separately
-                for etype in graph.etypes:
+                etypes = getattr(graph, 'etypes', [])
+                for etype in etypes:
                     try:
                         edges = graph.edges(etype=etype)
                         if len(edges[0]) > 0:  # Check if edges exist
