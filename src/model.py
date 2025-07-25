@@ -262,7 +262,7 @@ class CooperativeAttention(nn.Module):
             struct_attention = graph.ndata['struct_att']
             
             return struct_attention
-    
+
     def feature_attention(self, graph, feat):
         """Compute feature attention based on feature similarity"""
         with graph.local_scope():
@@ -294,7 +294,7 @@ class CooperativeAttention(nn.Module):
             feat_attention = graph.ndata['feat_att']
             
             return feat_attention
-    
+
     def cooperative_fusion(self, struct_att, feat_att):
         """Cooperatively fuse structural and feature attention"""
         # Concatenate both attention representations
@@ -307,7 +307,7 @@ class CooperativeAttention(nn.Module):
         fused_attention = gate * struct_att + (1 - gate) * feat_att
         
         return fused_attention
-    
+
     def forward(self, graph, feat):
         """
         Forward pass of cooperative attention
