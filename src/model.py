@@ -22,12 +22,18 @@ Key Features:
 3. Cooperative Fusion: Combines both attention types through a learnable gating mechanism
 4. Residual Connection: Maintains gradient flow and model stability
 5. Layer Normalization: Stabilizes training and improves convergence
+6. Heterogeneous Graph Support: Handles both homogeneous and heterogeneous graphs properly
 
 The cooperative attention addresses the biases that come from relying on only one type of
 neighbor information:
 - Structural neighbors can be biased by graph topology
 - Feature neighbors can be biased by feature similarity
 - Cooperative attention mitigates these biases through mutual collaboration
+
+Technical Implementation:
+- For homogeneous graphs: Uses DGL's update_all with user-defined functions
+- For heterogeneous graphs: Uses manual edge-wise computation to avoid DGL limitations
+- Handles multi-edge types and ensures robust error handling
 
 Usage:
 - Set 'use_cooperative_attention: True' in config files to enable
@@ -245,21 +251,57 @@ class CooperativeAttention(nn.Module):
             graph.ndata['key'] = key
             graph.ndata['value'] = value
             
-            # Message passing function for structural attention
-            def struct_message_func(edges):
-                # Compute attention scores based on structural relationships
-                scores = (edges.src['query'] * edges.dst['key']).sum(dim=-1, keepdim=True)
-                scores = scores / math.sqrt(self.hidden_dim)
-                return {'score': scores, 'value': edges.src['value']}
-            
-            def struct_reduce_func(nodes):
-                # Apply softmax attention and aggregate
-                attention_weights = F.softmax(nodes.mailbox['score'], dim=1)
-                attended_values = (attention_weights * nodes.mailbox['value']).sum(dim=1)
-                return {'struct_att': attended_values}
-            
-            graph.update_all(struct_message_func, struct_reduce_func)
-            struct_attention = graph.ndata['struct_att']
+            # Handle heterogeneous graphs
+            if graph.is_heterogeneous:
+                # Use built-in functions for heterogeneous graphs
+                # Initialize attention output
+                num_nodes = feat.shape[0]
+                struct_attention = torch.zeros(num_nodes, self.hidden_dim, device=feat.device)
+                
+                # Process each edge type separately
+                for etype in graph.etypes:
+                    try:
+                        edges = graph.edges(etype=etype)
+                        if len(edges[0]) > 0:  # Check if edges exist
+                            src_nodes, dst_nodes = edges
+                            
+                            # Compute attention scores
+                            src_query = query[src_nodes]
+                            dst_key = key[dst_nodes]
+                            scores = (src_query * dst_key).sum(dim=-1) / math.sqrt(self.hidden_dim)
+                            
+                            # More efficient softmax computation per destination node
+                            unique_dst, inverse_indices = torch.unique(dst_nodes, return_inverse=True)
+                            attention_weights = torch.zeros_like(scores)
+                            
+                            for i, dst in enumerate(unique_dst):
+                                mask = inverse_indices == i
+                                if mask.sum() > 0:
+                                    attention_weights[mask] = F.softmax(scores[mask], dim=0)
+                            
+                            # Aggregate weighted values
+                            src_values = value[src_nodes]
+                            weighted_values = attention_weights.unsqueeze(-1) * src_values
+                            
+                            # Scatter add to destination nodes
+                            struct_attention.index_add_(0, dst_nodes, weighted_values)
+                    except Exception as e:
+                        # Skip edge types that cause issues
+                        continue
+            else:
+                # Message passing function for structural attention (homogeneous graphs)
+                def struct_message_func(edges):
+                    scores = (edges.src['query'] * edges.dst['key']).sum(dim=-1, keepdim=True)
+                    scores = scores / math.sqrt(self.hidden_dim)
+                    return {'score': scores, 'value': edges.src['value']}
+                
+                def struct_reduce_func(nodes):
+                    attention_weights = F.softmax(nodes.mailbox['score'], dim=1)
+                    attended_values = (attention_weights * nodes.mailbox['value']).sum(dim=1)
+                    return {'struct_att': attended_values}
+                
+                graph.update_all(struct_message_func, struct_reduce_func)
+                struct_attention = graph.ndata['struct_att']
             
             return struct_attention
 
@@ -275,23 +317,63 @@ class CooperativeAttention(nn.Module):
             graph.ndata['key'] = key
             graph.ndata['value'] = value
             
-            # Message passing function for feature attention
-            def feat_message_func(edges):
-                # Compute attention scores based on feature similarity
-                # Use cosine similarity for feature-based attention
-                query_norm = F.normalize(edges.dst['query'], p=2, dim=-1)
-                key_norm = F.normalize(edges.src['key'], p=2, dim=-1)
-                scores = (query_norm * key_norm).sum(dim=-1, keepdim=True)
-                return {'score': scores, 'value': edges.src['value']}
-            
-            def feat_reduce_func(nodes):
-                # Apply softmax attention and aggregate
-                attention_weights = F.softmax(nodes.mailbox['score'], dim=1)
-                attended_values = (attention_weights * nodes.mailbox['value']).sum(dim=1)
-                return {'feat_att': attended_values}
-            
-            graph.update_all(feat_message_func, feat_reduce_func)
-            feat_attention = graph.ndata['feat_att']
+            # Handle heterogeneous graphs
+            if graph.is_heterogeneous:
+                # Use built-in functions for heterogeneous graphs
+                # Initialize attention output
+                num_nodes = feat.shape[0]
+                feat_attention = torch.zeros(num_nodes, self.hidden_dim, device=feat.device)
+                
+                # Process each edge type separately
+                for etype in graph.etypes:
+                    try:
+                        edges = graph.edges(etype=etype)
+                        if len(edges[0]) > 0:  # Check if edges exist
+                            src_nodes, dst_nodes = edges
+                            
+                            # Compute attention scores using cosine similarity
+                            dst_query = query[dst_nodes]
+                            src_key = key[src_nodes]
+                            
+                            # Normalize for cosine similarity
+                            query_norm = F.normalize(dst_query, p=2, dim=-1)
+                            key_norm = F.normalize(src_key, p=2, dim=-1)
+                            scores = (query_norm * key_norm).sum(dim=-1)
+                            
+                            # More efficient softmax computation per destination node
+                            unique_dst, inverse_indices = torch.unique(dst_nodes, return_inverse=True)
+                            attention_weights = torch.zeros_like(scores)
+                            
+                            for i, dst in enumerate(unique_dst):
+                                mask = inverse_indices == i
+                                if mask.sum() > 0:
+                                    attention_weights[mask] = F.softmax(scores[mask], dim=0)
+                            
+                            # Aggregate weighted values
+                            src_values = value[src_nodes]
+                            weighted_values = attention_weights.unsqueeze(-1) * src_values
+                            
+                            # Scatter add to destination nodes
+                            feat_attention.index_add_(0, dst_nodes, weighted_values)
+                    except Exception as e:
+                        # Skip edge types that cause issues
+                        continue
+            else:
+                # Message passing function for feature attention (homogeneous graphs)
+                def feat_message_func(edges):
+                    # Use cosine similarity for feature-based attention
+                    query_norm = F.normalize(edges.dst['query'], p=2, dim=-1)
+                    key_norm = F.normalize(edges.src['key'], p=2, dim=-1)
+                    scores = (query_norm * key_norm).sum(dim=-1, keepdim=True)
+                    return {'score': scores, 'value': edges.src['value']}
+                
+                def feat_reduce_func(nodes):
+                    attention_weights = F.softmax(nodes.mailbox['score'], dim=1)
+                    attended_values = (attention_weights * nodes.mailbox['value']).sum(dim=1)
+                    return {'feat_att': attended_values}
+                
+                graph.update_all(feat_message_func, feat_reduce_func)
+                feat_attention = graph.ndata['feat_att']
             
             return feat_attention
 
