@@ -225,14 +225,14 @@ class CooperativeAttention(nn.Module):
         
         # Initialize parameters
         self._init_parameters()
-    
+
     def _init_parameters(self):
         """Initialize parameters using Xavier uniform initialization"""
         for module in [self.struct_query, self.struct_key, self.struct_value,
                       self.feat_query, self.feat_key, self.feat_value,
                       self.cooperative_gate, self.output_proj]:
             nn.init.xavier_uniform_(module.weight)
-    
+
     def structural_attention(self, graph, feat):
         """Compute structural attention based on graph topology"""
         with graph.local_scope():
