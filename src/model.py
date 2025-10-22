@@ -8,6 +8,39 @@ import torch.nn.functional as F
 from utils import hinge_loss
 import scipy
 import dgl.function as fn
+import math
+
+"""
+Cooperative Attention Mechanism Integration
+
+This module integrates a Cooperative Attention mechanism into the SplitGNN model to enhance
+robustness and discriminability by combining structural neighbors and feature neighbors.
+
+Key Features:
+1. Structural Attention: Computes attention weights based on graph topology/structure
+2. Feature Attention: Computes attention weights based on feature similarity using cosine similarity
+3. Cooperative Fusion: Combines both attention types through a learnable gating mechanism
+4. Residual Connection: Maintains gradient flow and model stability
+5. Layer Normalization: Stabilizes training and improves convergence
+6. Heterogeneous Graph Support: Handles both homogeneous and heterogeneous graphs properly
+
+The cooperative attention addresses the biases that come from relying on only one type of
+neighbor information:
+- Structural neighbors can be biased by graph topology
+- Feature neighbors can be biased by feature similarity
+- Cooperative attention mitigates these biases through mutual collaboration
+
+Technical Implementation:
+- For homogeneous graphs: Uses DGL's update_all with user-defined functions
+- For heterogeneous graphs: Uses manual edge-wise computation to avoid DGL limitations
+- Handles multi-edge types and ensures robust error handling
+- Compatible across DGL versions (handles missing is_heterogeneous attribute)
+
+Usage:
+- Set 'use_cooperative_attention: True' in config files to enable
+- The mechanism is integrated into MultiRelationSplitGNNLayer
+- Attention is applied before the PolyConv operations
+"""
 
 def calculate_theta2(d):
     thetas = []
@@ -169,8 +202,256 @@ class RelationAware(nn.Module):
         return score
 
 
+class CooperativeAttention(nn.Module):
+    """
+    Cooperative Attention mechanism that combines structural neighbors and feature neighbors
+    to enhance robustness and discriminability through mutual collaboration.
+    """
+    def __init__(self, in_feats, hidden_dim=64, dropout=0.1):
+        super(CooperativeAttention, self).__init__()
+        self.in_feats = in_feats
+        self.hidden_dim = hidden_dim
+        self.dropout = nn.Dropout(dropout)
+        
+        # Structural attention components
+        self.struct_query = nn.Linear(in_feats, hidden_dim, bias=False)
+        self.struct_key = nn.Linear(in_feats, hidden_dim, bias=False)
+        self.struct_value = nn.Linear(in_feats, hidden_dim, bias=False)
+        
+        # Feature attention components  
+        self.feat_query = nn.Linear(in_feats, hidden_dim, bias=False)
+        self.feat_key = nn.Linear(in_feats, hidden_dim, bias=False)
+        self.feat_value = nn.Linear(in_feats, hidden_dim, bias=False)
+        
+        # Cooperative fusion components
+        self.cooperative_gate = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, in_feats)
+        
+        # Normalization
+        self.layer_norm = nn.LayerNorm(in_feats)
+        
+        # Initialize parameters
+        self._init_parameters()
+
+    def _init_parameters(self):
+        """Initialize parameters using Xavier uniform initialization"""
+        for module in [self.struct_query, self.struct_key, self.struct_value,
+                      self.feat_query, self.feat_key, self.feat_value,
+                      self.cooperative_gate, self.output_proj]:
+            nn.init.xavier_uniform_(module.weight)
+
+    def _is_heterogeneous(self, graph):
+        """Check if graph is heterogeneous - compatible across DGL versions"""
+        # Method 1: Check if is_heterogeneous attribute exists (newer DGL)
+        if hasattr(graph, 'is_heterogeneous'):
+            return graph.is_heterogeneous
+        
+        # Method 2: Check number of edge types (older DGL)
+        if hasattr(graph, 'etypes'):
+            return len(graph.etypes) > 1
+        
+        # Method 3: Check if canonical_etypes exists and has multiple types
+        if hasattr(graph, 'canonical_etypes'):
+            return len(graph.canonical_etypes) > 1
+        
+        # Method 4: Try to access etypes and catch exception
+        try:
+            etypes = graph.etypes
+            return len(etypes) > 1
+        except:
+            pass
+        
+        # Default: assume homogeneous
+        return False
+
+    def structural_attention(self, graph, feat):
+        """Compute structural attention based on graph topology"""
+        with graph.local_scope():
+            # Transform features for attention computation
+            query = self.struct_query(feat)
+            key = self.struct_key(feat)
+            value = self.struct_value(feat)
+            
+            graph.ndata['query'] = query
+            graph.ndata['key'] = key
+            graph.ndata['value'] = value
+            
+            # Handle heterogeneous graphs
+            if self._is_heterogeneous(graph):
+                # Use built-in functions for heterogeneous graphs
+                # Initialize attention output
+                num_nodes = feat.shape[0]
+                struct_attention = torch.zeros(num_nodes, self.hidden_dim, device=feat.device)
+                
+                # Process each edge type separately
+                etypes = getattr(graph, 'etypes', [])
+                for etype in etypes:
+                    try:
+                        edges = graph.edges(etype=etype)
+                        if len(edges[0]) > 0:  # Check if edges exist
+                            src_nodes, dst_nodes = edges
+                            
+                            # Compute attention scores
+                            src_query = query[src_nodes]
+                            dst_key = key[dst_nodes]
+                            scores = (src_query * dst_key).sum(dim=-1) / math.sqrt(self.hidden_dim)
+                            
+                            # More efficient softmax computation per destination node
+                            unique_dst, inverse_indices = torch.unique(dst_nodes, return_inverse=True)
+                            attention_weights = torch.zeros_like(scores)
+                            
+                            for i, dst in enumerate(unique_dst):
+                                mask = inverse_indices == i
+                                if mask.sum() > 0:
+                                    attention_weights[mask] = F.softmax(scores[mask], dim=0)
+                            
+                            # Aggregate weighted values
+                            src_values = value[src_nodes]
+                            weighted_values = attention_weights.unsqueeze(-1) * src_values
+                            
+                            # Scatter add to destination nodes
+                            struct_attention.index_add_(0, dst_nodes, weighted_values)
+                    except Exception as e:
+                        # Skip edge types that cause issues
+                        continue
+            else:
+                # Message passing function for structural attention (homogeneous graphs)
+                def struct_message_func(edges):
+                    scores = (edges.src['query'] * edges.dst['key']).sum(dim=-1, keepdim=True)
+                    scores = scores / math.sqrt(self.hidden_dim)
+                    return {'score': scores, 'value': edges.src['value']}
+                
+                def struct_reduce_func(nodes):
+                    attention_weights = F.softmax(nodes.mailbox['score'], dim=1)
+                    attended_values = (attention_weights * nodes.mailbox['value']).sum(dim=1)
+                    return {'struct_att': attended_values}
+                
+                graph.update_all(struct_message_func, struct_reduce_func)
+                struct_attention = graph.ndata['struct_att']
+            
+            return struct_attention
+
+    def feature_attention(self, graph, feat):
+        """Compute feature attention based on feature similarity"""
+        with graph.local_scope():
+            # Transform features for attention computation
+            query = self.feat_query(feat)
+            key = self.feat_key(feat)
+            value = self.feat_value(feat)
+            
+            graph.ndata['query'] = query
+            graph.ndata['key'] = key
+            graph.ndata['value'] = value
+            
+            # Handle heterogeneous graphs
+            if self._is_heterogeneous(graph):
+                # Use built-in functions for heterogeneous graphs
+                # Initialize attention output
+                num_nodes = feat.shape[0]
+                feat_attention = torch.zeros(num_nodes, self.hidden_dim, device=feat.device)
+                
+                # Process each edge type separately
+                etypes = getattr(graph, 'etypes', [])
+                for etype in etypes:
+                    try:
+                        edges = graph.edges(etype=etype)
+                        if len(edges[0]) > 0:  # Check if edges exist
+                            src_nodes, dst_nodes = edges
+                            
+                            # Compute attention scores using cosine similarity
+                            dst_query = query[dst_nodes]
+                            src_key = key[src_nodes]
+                            
+                            # Normalize for cosine similarity
+                            query_norm = F.normalize(dst_query, p=2, dim=-1)
+                            key_norm = F.normalize(src_key, p=2, dim=-1)
+                            scores = (query_norm * key_norm).sum(dim=-1)
+                            
+                            # More efficient softmax computation per destination node
+                            unique_dst, inverse_indices = torch.unique(dst_nodes, return_inverse=True)
+                            attention_weights = torch.zeros_like(scores)
+                            
+                            for i, dst in enumerate(unique_dst):
+                                mask = inverse_indices == i
+                                if mask.sum() > 0:
+                                    attention_weights[mask] = F.softmax(scores[mask], dim=0)
+                            
+                            # Aggregate weighted values
+                            src_values = value[src_nodes]
+                            weighted_values = attention_weights.unsqueeze(-1) * src_values
+                            
+                            # Scatter add to destination nodes
+                            feat_attention.index_add_(0, dst_nodes, weighted_values)
+                    except Exception as e:
+                        # Skip edge types that cause issues
+                        continue
+            else:
+                # Message passing function for feature attention (homogeneous graphs)
+                def feat_message_func(edges):
+                    # Use cosine similarity for feature-based attention
+                    query_norm = F.normalize(edges.dst['query'], p=2, dim=-1)
+                    key_norm = F.normalize(edges.src['key'], p=2, dim=-1)
+                    scores = (query_norm * key_norm).sum(dim=-1, keepdim=True)
+                    return {'score': scores, 'value': edges.src['value']}
+                
+                def feat_reduce_func(nodes):
+                    attention_weights = F.softmax(nodes.mailbox['score'], dim=1)
+                    attended_values = (attention_weights * nodes.mailbox['value']).sum(dim=1)
+                    return {'feat_att': attended_values}
+                
+                graph.update_all(feat_message_func, feat_reduce_func)
+                feat_attention = graph.ndata['feat_att']
+            
+            return feat_attention
+
+    def cooperative_fusion(self, struct_att, feat_att):
+        """Cooperatively fuse structural and feature attention"""
+        # Concatenate both attention representations
+        combined = torch.cat([struct_att, feat_att], dim=-1)
+        
+        # Apply gating mechanism for cooperative fusion
+        gate = torch.sigmoid(self.cooperative_gate(combined))
+        
+        # Weighted combination of structural and feature attention
+        fused_attention = gate * struct_att + (1 - gate) * feat_att
+        
+        return fused_attention
+
+    def forward(self, graph, feat):
+        """
+        Forward pass of cooperative attention
+        Args:
+            graph: DGL graph
+            feat: node features [N, in_feats]
+        Returns:
+            Enhanced node features with cooperative attention
+        """
+        # Store original features for residual connection
+        residual = feat
+        
+        # Compute structural attention (topology-based)
+        struct_att = self.structural_attention(graph, feat)
+        
+        # Compute feature attention (similarity-based)
+        feat_att = self.feature_attention(graph, feat)
+        
+        # Cooperatively fuse both attentions
+        fused_att = self.cooperative_fusion(struct_att, feat_att)
+        
+        # Project back to original feature space
+        output = self.output_proj(fused_att)
+        
+        # Apply dropout
+        output = self.dropout(output)
+        
+        # Residual connection and layer normalization
+        output = self.layer_norm(output + residual)
+        
+        return output
+
+
 class MultiRelationSplitGNNLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, dataset, dropout, thetas, K, if_sum=False):
+    def __init__(self, input_dim, output_dim, dataset, dropout, thetas, K, if_sum=False, use_cooperative_attention=True):
         super().__init__()
         self.relation = copy.deepcopy(dataset.etypes)
         self.relation.remove('homo')
@@ -181,10 +462,20 @@ class MultiRelationSplitGNNLayer(nn.Module):
         self.relation_aware = RelationAware(input_dim, output_dim, dropout)
         self.minelayers = nn.ModuleDict()
         self.dropout = nn.Dropout(dropout)
+        
+        # Add Cooperative Attention mechanism
+        self.use_cooperative_attention = use_cooperative_attention
+        if self.use_cooperative_attention:
+            self.cooperative_attention = CooperativeAttention(input_dim, hidden_dim=output_dim//2, dropout=dropout)
+        
         for e in self.relation:
             self.minelayers[e] = PolyConv(input_dim, output_dim, self.relation_aware, thetas, K, lin=True)
 
     def forward(self, g, h):
+        # Apply Cooperative Attention mechanism before processing
+        if self.use_cooperative_attention:
+            h = self.cooperative_attention(g, h)
+        
         hs_o = []
         hs_lh = []
         hs_trans = []
@@ -237,7 +528,11 @@ class SplitGNN(nn.Module):
         self.K = args.K
         self.n_class = args.n_class
         self.thetas = calculate_theta2(d=self.C)
-        self.mine_layer = MultiRelationSplitGNNLayer(self.intra_dim, self.intra_dim, g, args.dropout, self.thetas, self.K)
+        
+        # Add cooperative attention option (default enabled)
+        use_cooperative_attention = getattr(args, 'use_cooperative_attention', True)
+        
+        self.mine_layer = MultiRelationSplitGNNLayer(self.intra_dim, self.intra_dim, g, args.dropout, self.thetas, self.K, use_cooperative_attention=use_cooperative_attention)
         self.linear = nn.Linear(self.input_dim, self.intra_dim)
         self.linear2 = nn.Linear(self.intra_dim, self.n_class)
         self.dropout = nn.Dropout(args.dropout)

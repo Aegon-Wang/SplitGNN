@@ -18,4 +18,5 @@ K: 0
 intra_dim: 8
 n_class: 2
 dropout: 0.1
+use_cooperative_attention: True
 
